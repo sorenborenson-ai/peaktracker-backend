@@ -26,36 +26,23 @@ const PORT = process.env.PORT || 3000;
 
 /**
  * POST /analyze
- * Body: { userContent: string, systemPrompt?: string, temperature?: number }
- * Used for habit feedback and load analysis.
+ * Body: { userContent: string, systemPrompt: string, temperature?: number }
+ * App sends the full system prompt; backend just forwards to OpenAI.
  */
 app.post('/analyze', async (req, res) => {
   try {
-    const { userContent, systemPrompt: customPrompt, temperature = 0.7 } = req.body;
+    const { userContent, systemPrompt, temperature = 0.7 } = req.body;
     if (!userContent || typeof userContent !== 'string') {
       return res.status(400).json({ error: 'userContent is required' });
     }
-
-    const dateTime = new Date().toLocaleString('en-US', { dateStyle: 'long', timeStyle: 'short' });
-    const habitSystemPrompt = `You are an ambitious, positive, yet brutally honest performance coach, like a successful entrepreneur friend.
-Never start with anything like 'Alright,' just get straight to the point.
-Evaluate the entire habit list as a whole.
-You are evaluating primarily the habits list, not the targets list but you can give habit recomendations for their targets.
-use two sentances to get your point across
-Put a line break between each sentence so each sentence is on its own line.
-Be constructive, direct, and concise — do not use motivational fluff.
-Make it feel like human feedback, not a report.
-And can play along if their habits are obviously a joke.
-Do not use bold section labels like **Example** or **Note**. If you need a heading, use a markdown header instead (e.g. "# Title" or "## Subtitle") so it renders as a larger font.`;
-
-    const systemContent = customPrompt && customPrompt.trim()
-      ? `Current date and time: ${dateTime}.\n\n${customPrompt}`
-      : `Current date and time: ${dateTime}.\n\n${habitSystemPrompt}`;
+    if (!systemPrompt || typeof systemPrompt !== 'string') {
+      return res.status(400).json({ error: 'systemPrompt is required' });
+    }
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4.1-mini',
       messages: [
-        { role: 'system', content: systemContent },
+        { role: 'system', content: systemPrompt },
         { role: 'user', content: userContent }
       ],
       temperature: Number(temperature),
