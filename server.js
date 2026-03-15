@@ -24,9 +24,9 @@ const openai = new OpenAI({ apiKey });
 
 const PORT = process.env.PORT || 3000;
 
-// Root URL: so visiting the Render URL in a browser doesn't show "Cannot GET /"
-app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'PeakTracker backend', endpoints: ['POST /analyze', 'POST /chat'] });
+// Root route
+app.get("/", (req, res) => {
+  res.send("Backend is running");
 });
 
 /**
@@ -104,5 +104,5 @@ app.post('/chat', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PeakTracker backend running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
