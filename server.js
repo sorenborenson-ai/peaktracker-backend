@@ -24,6 +24,11 @@ const openai = new OpenAI({ apiKey });
 
 const PORT = process.env.PORT || 3000;
 
+// Root URL: so visiting the Render URL in a browser doesn't show "Cannot GET /"
+app.get('/', (req, res) => {
+  res.json({ ok: true, service: 'PeakTracker backend', endpoints: ['POST /analyze', 'POST /chat'] });
+});
+
 /**
  * POST /analyze
  * Body: { userContent: string, systemPrompt: string, temperature?: number }
@@ -62,10 +67,6 @@ app.post('/analyze', async (req, res) => {
     const message = err.message || 'OpenAI request failed';
     res.status(status).json({ error: message });
   }
-});
-
-app.get("/", (req, res) => {
-  res.send("Backend is running");
 });
 
 /**
