@@ -64,6 +64,10 @@ app.post('/analyze', async (req, res) => {
   }
 });
 
+app.get("/", (req, res) => {
+  res.send("Backend is running");
+});
+
 /**
  * POST /chat
  * Body: { messages: [{ role: string, content: string }], systemPrompt?: string }
