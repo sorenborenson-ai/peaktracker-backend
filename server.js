@@ -103,6 +103,78 @@ app.post('/chat', async (req, res) => {
   }
 });
 
+/**
+ * POST /chat/stream
+ * Body: { messages: [{ role, content }], systemPrompt?: string }
+ * Streams SSE tokens from OpenAI so the client can display them in real time.
+ */
+app.post('/chat/stream', async (req, res) => {
+  try {
+    const { messages, systemPrompt } = req.body;
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages array is required' });
+    }
+
+    const apiMessages = [...messages];
+    if (systemPrompt && typeof systemPrompt === 'string' && systemPrompt.trim()) {
+      apiMessages.unshift({ role: 'system', content: systemPrompt.trim() });
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    const stream = await openai.chat.completions.create({
+      model: 'gpt-4.1-mini',
+      messages: apiMessages,
+      temperature: 0.5,
+      max_tokens: 3000,
+      stream: true,
+    });
+
+    for await (const chunk of stream) {
+      const token = chunk.choices[0]?.delta?.content;
+      if (token) {
+        res.write(`data: ${JSON.stringify({ token })}\n\n`);
+      }
+    }
+
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch (err) {
+    console.error('OpenAI /chat/stream error:', err);
+    if (!res.headersSent) {
+      res.status(err.status || 500).json({ error: err.message || 'Stream failed' });
+    } else {
+      res.write(`data: ${JSON.stringify({ error: err.message || 'Stream failed' })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+/**
+ * POST /embed
+ * Body: { input: string }
+ * Returns a 1536-float embedding vector for use with pgvector / search_ai_embeddings.
+ */
+app.post('/embed', async (req, res) => {
+  try {
+    const { input } = req.body;
+    if (!input || typeof input !== 'string') {
+      return res.status(400).json({ error: 'input is required' });
+    }
+    const response = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      input: input.slice(0, 8000),
+    });
+    const embedding = response.data[0]?.embedding ?? [];
+    res.json({ embedding });
+  } catch (err) {
+    console.error('OpenAI /embed error:', err);
+    res.status(err.status || 500).json({ error: err.message || 'Embed failed' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
