@@ -8,8 +8,8 @@ app.use(express.json());
 // Allow Mac app (and any origin when developing)
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
@@ -184,7 +184,12 @@ function rateLimit(req, res, routeKey) {
   return true;
 }
 
-const YT_API_KEY = process.env.YT_API_KEY;
+const YT_API_KEY             = process.env.YT_API_KEY;
+const YT_OAUTH_CLIENT_ID     = process.env.YT_OAUTH_CLIENT_ID;
+const YT_OAUTH_CLIENT_SECRET = process.env.YT_OAUTH_CLIENT_SECRET;
+const YT_OAUTH_REDIRECT      = process.env.YT_OAUTH_REDIRECT;
+const SUPABASE_URL                = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 async function youtubeChannelsList({ id, handle }) {
   if (!YT_API_KEY) throw new Error('YT_API_KEY not set on server');
@@ -283,6 +288,224 @@ app.get('/social/youtube/resolveHandle', async (req, res) => {
   } catch (err) {
     console.error('/social/youtube/resolveHandle error:', err);
     res.status(err.status || 500).json({ error: err.message || 'YouTube request failed' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// YouTube OAuth + Analytics API (deep channel-owner data)
+// ---------------------------------------------------------------------------
+//
+// Flow: iOS hits /oauth/start with its Supabase bearer → backend 302s to
+// Google → Google calls back to /oauth/callback → backend exchanges code,
+// persists tokens in Supabase (`yt_oauth_tokens`), then redirects to
+// `peaktracker://youtube-oauth?status=ok`. After that, iOS calls /analytics
+// with its Supabase bearer and the backend uses the stored token.
+
+const ytOAuthState = new Map(); // state → { userId, expiresAt }
+
+function rememberOAuthState(userId) {
+  const state = require('crypto').randomBytes(16).toString('hex');
+  ytOAuthState.set(state, { userId, expiresAt: Date.now() + 10 * 60 * 1000 });
+  for (const [k, v] of ytOAuthState) if (v.expiresAt < Date.now()) ytOAuthState.delete(k);
+  return state;
+}
+
+function consumeOAuthState(state) {
+  const entry = ytOAuthState.get(state);
+  if (!entry) return null;
+  ytOAuthState.delete(state);
+  if (entry.expiresAt < Date.now()) return null;
+  return entry.userId;
+}
+
+/// Verify a Supabase access token against /auth/v1/user and return the user id.
+async function requireSupabaseUserId(req) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    const e = new Error('Supabase admin not configured on server.');
+    e.status = 500; throw e;
+  }
+  const authHeader = (req.headers.authorization || '').trim();
+  if (!authHeader.toLowerCase().startsWith('bearer ')) {
+    const e = new Error('Missing access token.'); e.status = 401; throw e;
+  }
+  const accessToken = authHeader.slice(7).trim();
+  const resp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: { apikey: SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${accessToken}` },
+  });
+  if (!resp.ok) { const e = new Error('Invalid or expired session.'); e.status = 401; throw e; }
+  const user = await resp.json();
+  const userId = user?.id;
+  if (!userId) { const e = new Error('Could not resolve user id.'); e.status = 401; throw e; }
+  return userId;
+}
+
+app.get('/social/youtube/oauth/start', async (req, res) => {
+  try {
+    if (!YT_OAUTH_CLIENT_ID || !YT_OAUTH_REDIRECT) {
+      return res.status(500).json({ error: 'YouTube OAuth not configured on server.' });
+    }
+    const userId = await requireSupabaseUserId(req);
+    const state = rememberOAuthState(userId);
+    const params = new URLSearchParams({
+      client_id: YT_OAUTH_CLIENT_ID,
+      redirect_uri: YT_OAUTH_REDIRECT,
+      response_type: 'code',
+      scope: [
+        'https://www.googleapis.com/auth/yt-analytics.readonly',
+        'https://www.googleapis.com/auth/youtube.readonly',
+      ].join(' '),
+      access_type: 'offline',
+      prompt: 'consent',
+      state,
+    });
+    res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+app.get('/social/youtube/oauth/callback', async (req, res) => {
+  const appReturn = (status, reason) => {
+    const q = new URLSearchParams({ status });
+    if (reason) q.set('reason', reason);
+    return res.redirect(`peaktracker://youtube-oauth?${q.toString()}`);
+  };
+  try {
+    const { code, state, error } = req.query;
+    if (error) return appReturn('error', String(error));
+    if (!code || !state) return res.status(400).send('Missing code or state.');
+    const userId = consumeOAuthState(String(state));
+    if (!userId) return res.status(400).send('OAuth state invalid or expired. Try signing in again.');
+
+    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code: String(code),
+        client_id: YT_OAUTH_CLIENT_ID,
+        client_secret: YT_OAUTH_CLIENT_SECRET,
+        redirect_uri: YT_OAUTH_REDIRECT,
+        grant_type: 'authorization_code',
+      }),
+    });
+    const tokens = await tokenResp.json();
+    if (!tokenResp.ok) {
+      console.error('YT OAuth token exchange failed:', tokens);
+      return appReturn('error', 'token_exchange');
+    }
+
+    const expiresAt = new Date(Date.now() + (tokens.expires_in || 3600) * 1000).toISOString();
+    const upsertResp = await fetch(`${SUPABASE_URL}/rest/v1/yt_oauth_tokens?on_conflict=user_id`, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates',
+      },
+      body: JSON.stringify({
+        user_id: userId,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token, // only on first consent / prompt=consent
+        expires_at: expiresAt,
+        updated_at: new Date().toISOString(),
+      }),
+    });
+    if (!upsertResp.ok) {
+      console.error('YT OAuth persist failed:', await upsertResp.text());
+      return appReturn('error', 'persist');
+    }
+    appReturn('ok');
+  } catch (err) {
+    console.error('/social/youtube/oauth/callback error:', err);
+    appReturn('error', err.message || 'unknown');
+  }
+});
+
+/// Returns a fresh access token for `userId`, refreshing via the stored
+/// refresh token if the current access token is within 60s of expiry. Throws
+/// 401 if the user has no row or no refresh token (force reconnect).
+async function getYouTubeAccessTokenForUser(userId) {
+  const fetchResp = await fetch(
+    `${SUPABASE_URL}/rest/v1/yt_oauth_tokens?user_id=eq.${encodeURIComponent(userId)}&select=*`,
+    { headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    } }
+  );
+  if (!fetchResp.ok) { const e = new Error('Failed to read token store.'); e.status = 500; throw e; }
+  const rows = await fetchResp.json();
+  const row = Array.isArray(rows) ? rows[0] : null;
+  if (!row) { const e = new Error('YouTube not connected for this user.'); e.status = 404; throw e; }
+
+  const expiresAt = row.expires_at ? new Date(row.expires_at).getTime() : 0;
+  if (Date.now() < expiresAt - 60_000) return row.access_token;
+
+  if (!row.refresh_token) {
+    const e = new Error('No refresh token on file. Reconnect YouTube.'); e.status = 401; throw e;
+  }
+  const refreshResp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: YT_OAUTH_CLIENT_ID,
+      client_secret: YT_OAUTH_CLIENT_SECRET,
+      refresh_token: row.refresh_token,
+      grant_type: 'refresh_token',
+    }),
+  });
+  const refreshed = await refreshResp.json();
+  if (!refreshResp.ok) {
+    console.error('YT OAuth refresh failed:', refreshed);
+    const e = new Error('Refresh failed. Reconnect YouTube.'); e.status = 401; throw e;
+  }
+  const newExpiry = new Date(Date.now() + (refreshed.expires_in || 3600) * 1000).toISOString();
+  await fetch(`${SUPABASE_URL}/rest/v1/yt_oauth_tokens?user_id=eq.${encodeURIComponent(userId)}`, {
+    method: 'PATCH',
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      access_token: refreshed.access_token,
+      expires_at: newExpiry,
+      updated_at: new Date().toISOString(),
+    }),
+  });
+  return refreshed.access_token;
+}
+
+app.get('/social/youtube/analytics', async (req, res) => {
+  if (!rateLimit(req, res, 'yt:analytics')) return;
+  try {
+    const userId = await requireSupabaseUserId(req);
+    let days = Number(req.query.days);
+    if (!Number.isFinite(days) || days <= 0 || days > 365) days = 28;
+    const accessToken = await getYouTubeAccessTokenForUser(userId);
+
+    const ymd = (d) => d.toISOString().slice(0, 10);
+    const params = new URLSearchParams({
+      ids: 'channel==MINE',
+      startDate: ymd(new Date(Date.now() - days * 86400 * 1000)),
+      endDate: ymd(new Date()),
+      metrics: 'views,estimatedMinutesWatched,averageViewDuration,averageViewPercentage,subscribersGained,subscribersLost',
+    });
+    const reportResp = await fetch(`https://youtubeanalytics.googleapis.com/v2/reports?${params}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    const report = await reportResp.json();
+    if (!reportResp.ok) {
+      console.error('YT Analytics error:', report);
+      return res.status(reportResp.status).json({ error: report?.error?.message || 'YouTube Analytics request failed' });
+    }
+    const headers = (report.columnHeaders || []).map(h => h.name);
+    const row = (report.rows || [])[0] || [];
+    const stats = headers.map((name, i) => ({ key: `yt_${name}`, value: Number(row[i] || 0) }));
+    res.json({ windowDays: days, stats });
+  } catch (err) {
+    console.error('/social/youtube/analytics error:', err);
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
@@ -404,6 +627,64 @@ app.post('/embed', async (req, res) => {
   } catch (err) {
     console.error('OpenAI /embed error:', err);
     res.status(err.status || 500).json({ error: err.message || 'Embed failed' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Account deletion
+// ---------------------------------------------------------------------------
+//
+// The Swift client sends its Supabase access token as `Authorization: Bearer
+// <token>`. We verify the token by calling Supabase's /auth/v1/user with that
+// token (which returns the user record if the JWT is valid), then call the
+// admin DELETE endpoint with the service-role key. The service-role key never
+// ships in the iOS/Mac bundles — that's the whole reason this proxy exists.
+
+app.post('/auth/delete-account', async (req, res) => {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(500).json({ error: 'Supabase admin not configured on server.' });
+    }
+    const authHeader = (req.headers.authorization || '').trim();
+    if (!authHeader.toLowerCase().startsWith('bearer ')) {
+      return res.status(401).json({ error: 'Missing access token.' });
+    }
+    const accessToken = authHeader.slice(7).trim();
+    if (!accessToken) {
+      return res.status(401).json({ error: 'Missing access token.' });
+    }
+
+    // Verify the access token and resolve the user id.
+    const userResp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+    if (!userResp.ok) {
+      return res.status(401).json({ error: 'Invalid or expired session.' });
+    }
+    const user = await userResp.json();
+    const userId = user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: 'Could not resolve user id.' });
+    }
+
+    const delResp = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${encodeURIComponent(userId)}`, {
+      method: 'DELETE',
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    });
+    if (!delResp.ok) {
+      const body = await delResp.text().catch(() => '');
+      return res.status(delResp.status).json({ error: `Delete failed: ${body.slice(0, 300)}` });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('/auth/delete-account error:', err);
+    res.status(500).json({ error: err.message || 'Delete failed' });
   }
 });
 
