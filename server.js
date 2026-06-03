@@ -298,7 +298,7 @@ app.get('/social/youtube/resolveHandle', async (req, res) => {
 // Flow: iOS hits /oauth/start with its Supabase bearer → backend 302s to
 // Google → Google calls back to /oauth/callback → backend exchanges code,
 // persists tokens in Supabase (`yt_oauth_tokens`), then redirects to
-// `peaktracker://youtube-oauth?status=ok`. After that, iOS calls /analytics
+// `peaktracker-oauth://youtube/done?status=ok`. After that, iOS calls /analytics
 // with its Supabase bearer and the backend uses the stored token.
 
 const ytOAuthState = new Map(); // state → { userId, expiresAt }
@@ -358,7 +358,7 @@ app.get('/social/youtube/oauth/start', async (req, res) => {
       prompt: 'consent',
       state,
     });
-    res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+    res.json({ url: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`, state });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message });
   }
@@ -368,7 +368,7 @@ app.get('/social/youtube/oauth/callback', async (req, res) => {
   const appReturn = (status, reason) => {
     const q = new URLSearchParams({ status });
     if (reason) q.set('reason', reason);
-    return res.redirect(`peaktracker://youtube-oauth?${q.toString()}`);
+    return res.redirect(`peaktracker-oauth://youtube/done?${q.toString()}`);
   };
   try {
     const { code, state, error } = req.query;
