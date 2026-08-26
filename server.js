@@ -1,7 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const { OpenAI } = require('openai');
-
+const { Zernio } = require('@zernio/node');
+const zernio = new Zernio({ apiKey: process.env.ZERNIO_API_KEY });
 const app = express();
 app.use(express.json());
 
@@ -352,6 +353,7 @@ app.get('/social/youtube/oauth/start', async (req, res) => {
       response_type: 'code',
       scope: [
         'https://www.googleapis.com/auth/yt-analytics.readonly',
+        'https://www.googleapis.com/auth/yt-analytics-monetary.readonly',
         'https://www.googleapis.com/auth/youtube.readonly',
       ].join(' '),
       access_type: 'offline',
@@ -485,26 +487,269 @@ app.get('/social/youtube/analytics', async (req, res) => {
     const accessToken = await getYouTubeAccessTokenForUser(userId);
 
     const ymd = (d) => d.toISOString().slice(0, 10);
-    const params = new URLSearchParams({
+    const metricsList = [
+      'views',
+      'estimatedMinutesWatched',
+      'averageViewDuration',
+      'averageViewPercentage',
+      'subscribersGained',
+      'subscribersLost',
+      'likes',
+      'dislikes',
+      'comments',
+      'shares',
+      'cardImpressions',
+      'cardClickRate',
+      'estimatedRevenue',
+      'estimatedAdRevenue',
+      'cpm',
+      'playbackBasedCpm',
+      // Reach-tab additions: the funnel + KPI quad on the YT Studio "Reach"
+      // tab is built from these three. `impressions` is the count of times
+      // a video thumbnail surfaced; `impressionsClickThroughRate` is the
+      // server-side CTR YouTube reports (0–1, not 0–100); `uniqueViewers`
+      // is the de-duplicated viewer count for the window.
+      'impressions',
+      'impressionsClickThroughRate',
+      'uniqueViewers',
+    ].join(',');
+
+    // Two windows back-to-back so the UI can render the "↑10% vs prior 28d"
+    // deltas YT Studio shows. End-of-prior == start-of-current (YouTube
+    // Analytics treats startDate as inclusive and endDate as inclusive too,
+    // but the day-count math `Date.now() - days*86400000` is what's been
+    // shipping; we keep that convention and accept that one boundary day
+    // overlaps. Matches what the existing UI assumes "windowDays" means.)
+    const now = Date.now();
+    const currentStart = ymd(new Date(now - days * 86400 * 1000));
+    const currentEnd   = ymd(new Date(now));
+    const priorStart   = ymd(new Date(now - 2 * days * 86400 * 1000));
+    const priorEnd     = ymd(new Date(now - days * 86400 * 1000));
+
+    const buildParams = (startDate, endDate) => new URLSearchParams({
       ids: 'channel==MINE',
-      startDate: ymd(new Date(Date.now() - days * 86400 * 1000)),
-      endDate: ymd(new Date()),
-      metrics: 'views,estimatedMinutesWatched,averageViewDuration,averageViewPercentage,subscribersGained,subscribersLost',
+      startDate,
+      endDate,
+      metrics: metricsList,
     });
-    const reportResp = await fetch(`https://youtubeanalytics.googleapis.com/v2/reports?${params}`, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-    const report = await reportResp.json();
-    if (!reportResp.ok) {
-      console.error('YT Analytics error:', report);
-      return res.status(reportResp.status).json({ error: report?.error?.message || 'YouTube Analytics request failed' });
+
+    const fetchReport = async (params) => {
+      const resp = await fetch(`https://youtubeanalytics.googleapis.com/v2/reports?${params}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const body = await resp.json();
+      return { ok: resp.ok, status: resp.status, body };
+    };
+
+    const [cur, prev] = await Promise.all([
+      fetchReport(buildParams(currentStart, currentEnd)),
+      fetchReport(buildParams(priorStart, priorEnd)),
+    ]);
+
+    if (!cur.ok) {
+      console.error('YT Analytics error (current):', cur.body);
+      return res.status(cur.status).json({ error: cur.body?.error?.message || 'YouTube Analytics request failed' });
     }
-    const headers = (report.columnHeaders || []).map(h => h.name);
-    const row = (report.rows || [])[0] || [];
-    const stats = headers.map((name, i) => ({ key: `yt_${name}`, value: Number(row[i] || 0) }));
-    res.json({ windowDays: days, stats });
+
+    const toStats = (report) => {
+      const headers = (report.columnHeaders || []).map(h => h.name);
+      const row = (report.rows || [])[0] || [];
+      return headers.map((name, i) => ({ key: `yt_${name}`, value: Number(row[i] || 0) }));
+    };
+
+    const currentStats = toStats(cur.body);
+    // Prior window may legitimately have no data (new channel, gap in
+    // history). Fall back to an empty array rather than 500ing the whole
+    // request — the UI shows the KPI quad without deltas in that case.
+    const previousStats = prev.ok ? toStats(prev.body) : [];
+
+    res.json({
+      windowDays: days,
+      // `stats` mirrors the original shape so older clients keep working.
+      stats: currentStats,
+      current: { stats: currentStats },
+      previous: { stats: previousStats },
+    });
   } catch (err) {
     console.error('/social/youtube/analytics error:', err);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /social/youtube/analytics/timeseries?days=N
+ * Per-day series for the Reach screen's headline chart. Returns one row
+ * per day with the four KPI metrics (impressions, views, CTR, unique
+ * viewers) plus watch-time minutes. `date` is "YYYY-MM-DD" as YouTube
+ * reports it (channel-local timezone).
+ */
+app.get('/social/youtube/analytics/timeseries', async (req, res) => {
+  if (!rateLimit(req, res, 'yt:timeseries')) return;
+  try {
+    const report = await runYouTubeAnalyticsReport(req, {
+      metrics: 'impressions,views,estimatedMinutesWatched,impressionsClickThroughRate,uniqueViewers',
+      dimensions: 'day',
+      sort: 'day',
+    });
+    const points = report.rows.map(row => {
+      const obj = {};
+      report.columns.forEach((name, i) => {
+        if (name === 'day') obj.date = String(row[i] || '');
+        else obj[name] = Number(row[i] || 0);
+      });
+      return obj;
+    });
+    res.json({ windowDays: report.windowDays, points });
+  } catch (err) {
+    console.error('/social/youtube/analytics/timeseries error:', err);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+/// Shared runner for multi-row YouTube Analytics reports. Returns
+/// `{ windowDays, columns, rows }` where columns is the ordered list of
+/// dimension + metric names and rows is the raw row array. iOS shapes each
+/// dimension's keys via its own decoder.
+async function runYouTubeAnalyticsReport(req, { metrics, dimensions, sort, maxResults }) {
+  const userId = await requireSupabaseUserId(req);
+  let days = Number(req.query.days);
+  if (!Number.isFinite(days) || days <= 0 || days > 365) days = 28;
+  const accessToken = await getYouTubeAccessTokenForUser(userId);
+
+  const ymd = (d) => d.toISOString().slice(0, 10);
+  const params = new URLSearchParams({
+    ids: 'channel==MINE',
+    startDate: ymd(new Date(Date.now() - days * 86400 * 1000)),
+    endDate: ymd(new Date()),
+    metrics,
+  });
+  if (dimensions) params.set('dimensions', dimensions);
+  if (sort) params.set('sort', sort);
+  if (maxResults) params.set('maxResults', String(maxResults));
+
+  const resp = await fetch(`https://youtubeanalytics.googleapis.com/v2/reports?${params}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const report = await resp.json();
+  if (!resp.ok) {
+    const e = new Error(report?.error?.message || 'YouTube Analytics request failed');
+    e.status = resp.status;
+    throw e;
+  }
+  const columns = (report.columnHeaders || []).map(h => h.name);
+  const rows = report.rows || [];
+  return { windowDays: days, columns, rows };
+}
+
+/**
+ * GET /social/youtube/analytics/videos?days=N
+ * Top-10 videos by views in the window, with watch time / likes / comments.
+ * Backend returns the raw video IDs; iOS hydrates titles + thumbnails
+ * separately via /social/youtube/videoMeta if it needs them.
+ */
+app.get('/social/youtube/analytics/videos', async (req, res) => {
+  if (!rateLimit(req, res, 'yt:videos')) return;
+  try {
+    const report = await runYouTubeAnalyticsReport(req, {
+      metrics: 'views,estimatedMinutesWatched,averageViewDuration,likes,comments',
+      dimensions: 'video',
+      sort: '-views',
+      maxResults: 10,
+    });
+    const videos = report.rows.map(row => {
+      const obj = {};
+      report.columns.forEach((name, i) => {
+        if (name === 'video') obj.videoId = String(row[i] || '');
+        else obj[name] = Number(row[i] || 0);
+      });
+      return obj;
+    });
+    res.json({ windowDays: report.windowDays, videos });
+  } catch (err) {
+    console.error('/social/youtube/analytics/videos error:', err);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /social/youtube/analytics/traffic?days=N
+ * Breakdown by traffic source (search, suggested, browse, external, etc.).
+ */
+app.get('/social/youtube/analytics/traffic', async (req, res) => {
+  if (!rateLimit(req, res, 'yt:traffic')) return;
+  try {
+    const report = await runYouTubeAnalyticsReport(req, {
+      metrics: 'views,estimatedMinutesWatched',
+      dimensions: 'insightTrafficSourceType',
+      sort: '-views',
+    });
+    const sources = report.rows.map(row => {
+      const obj = {};
+      report.columns.forEach((name, i) => {
+        if (name === 'insightTrafficSourceType') obj.source = String(row[i] || '');
+        else obj[name] = Number(row[i] || 0);
+      });
+      return obj;
+    });
+    res.json({ windowDays: report.windowDays, sources });
+  } catch (err) {
+    console.error('/social/youtube/analytics/traffic error:', err);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /social/youtube/analytics/demographics?days=N
+ * Viewer age + gender split. Each row is `{ ageGroup, gender, viewerPercentage }`.
+ * For small channels YouTube may omit data below a privacy threshold.
+ */
+app.get('/social/youtube/analytics/demographics', async (req, res) => {
+  if (!rateLimit(req, res, 'yt:demographics')) return;
+  try {
+    const report = await runYouTubeAnalyticsReport(req, {
+      metrics: 'viewerPercentage',
+      dimensions: 'ageGroup,gender',
+      sort: 'gender,ageGroup',
+    });
+    const buckets = report.rows.map(row => {
+      const obj = {};
+      report.columns.forEach((name, i) => {
+        if (name === 'ageGroup' || name === 'gender') obj[name] = String(row[i] || '');
+        else obj[name] = Number(row[i] || 0);
+      });
+      return obj;
+    });
+    res.json({ windowDays: report.windowDays, buckets });
+  } catch (err) {
+    console.error('/social/youtube/analytics/demographics error:', err);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /social/youtube/analytics/geography?days=N
+ * Top-25 viewer countries by views in the window.
+ */
+app.get('/social/youtube/analytics/geography', async (req, res) => {
+  if (!rateLimit(req, res, 'yt:geography')) return;
+  try {
+    const report = await runYouTubeAnalyticsReport(req, {
+      metrics: 'views,estimatedMinutesWatched',
+      dimensions: 'country',
+      sort: '-views',
+      maxResults: 25,
+    });
+    const countries = report.rows.map(row => {
+      const obj = {};
+      report.columns.forEach((name, i) => {
+        if (name === 'country') obj.country = String(row[i] || '');
+        else obj[name] = Number(row[i] || 0);
+      });
+      return obj;
+    });
+    res.json({ windowDays: report.windowDays, countries });
+  } catch (err) {
+    console.error('/social/youtube/analytics/geography error:', err);
     res.status(err.status || 500).json({ error: err.message });
   }
 });
@@ -687,6 +932,73 @@ app.post('/auth/delete-account', async (req, res) => {
     res.status(500).json({ error: err.message || 'Delete failed' });
   }
 });
+
+app.get('/zernio/connect', async (req, res) => {
+  try {
+    const { platform, profileId } = req.query;
+    if (!platform)   return res.status(400).json({ error: 'platform is required' });
+    if (!profileId)  return res.status(400).json({ error: 'profileId is required' });
+    const { data } = await zernio.connect.getConnectUrl({
+      path:  { platform },
+      query: { profileId },
+    });
+    res.json({ authUrl: data.authUrl });
+  } catch (err) {
+    console.error('/zernio/connect error:', err);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+app.post('/zernio/create-profile' , async (req, res) => {
+  try {
+    const { data } = await zernio.profiles.createProfile({
+      body: {
+      name: 'My First Profile',
+      description: 'Testing the Zernio API'
+      }
+    });
+    
+    console.log('Profile created:', data.profile._id);
+    res.json({ profileId: data.profile._id });
+
+  } catch (err) {
+    console.error('/zernio/create-profile error:', err);
+    res.status(500).json({ error: err.message || 'Zernio create profile failed' });
+  }
+})
+
+app.post('/zernio/test-instagram' , async (req, res) => {
+  try {
+    const { data } = await zernio.connect.getConnectUrl({
+      path: { platform: 'instagram' },
+      query: { profileId: '6a84ad8827fd5d893ec46118' } // the profile _id from Step 1
+    });
+    console.log('Open this URL:', data.authUrl);
+    
+    
+  } catch (err) {
+    console.error('/zernio/create-profile error:', err);
+    res.status(500).json({ error: err.message || 'Zernio create profile failed' });
+  }
+})
+
+app.post('/zernio/list-accounts' , async (req, res) => {
+  
+  try {
+    const { data } = await zernio.accounts.listAccounts();
+    for (const account of data.accounts) {
+      console.log(`${account.platform}: ${account._id}`);
+    }
+// → twitter: 66b2e19d8c3f5a7e9d0b1c2d
+    
+    
+  } catch (err) {
+    console.error('/zernio/create-profile error:', err);
+    res.status(500).json({ error: err.message || 'Zernio create profile failed' });
+  }
+})
+    
+  
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
