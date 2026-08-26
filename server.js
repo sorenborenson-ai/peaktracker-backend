@@ -292,6 +292,37 @@ app.get('/social/youtube/resolveHandle', async (req, res) => {
   }
 });
 
+/**
+ * GET /social/youtube/me
+ * Requires: Authorization: Bearer <supabase-access-token>
+ * Uses the stored OAuth token to fetch the authenticated user's own channel
+ * info (snippet + statistics) without needing to know the channel ID upfront.
+ * Returns the same YouTubeChannelInfo shape as /stats and /resolveHandle.
+ */
+app.get('/social/youtube/me', async (req, res) => {
+  try {
+    const userId = await requireSupabaseUserId(req);
+    const accessToken = await getYouTubeAccessTokenForUser(userId);
+    const params = new URLSearchParams({ part: 'snippet,statistics,contentDetails', mine: 'true' });
+    const ytResp = await fetch(`https://www.googleapis.com/youtube/v3/channels?${params}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    const ytJson = await ytResp.json();
+    if (!ytResp.ok) {
+      const msg = ytJson?.error?.message || `YouTube API error ${ytResp.status}`;
+      const e = new Error(msg); e.status = ytResp.status; throw e;
+    }
+    const item = ytJson?.items?.[0];
+    if (!item) { const e = new Error('No channel found for this account.'); e.status = 404; throw e; }
+    const uploads = item.contentDetails?.relatedPlaylists?.uploads;
+    const lastUpload = await youtubeLastUploadAt(uploads);
+    res.json(buildYouTubeChannelInfo(item, lastUpload));
+  } catch (err) {
+    console.error('/social/youtube/me error:', err);
+    res.status(err.status || 500).json({ error: err.message || 'YouTube request failed' });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // YouTube OAuth + Analytics API (deep channel-owner data)
 // ---------------------------------------------------------------------------
