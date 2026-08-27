@@ -168,7 +168,7 @@ app.post('/chat/stream', async (req, res) => {
 // when this Render instance restarts is one extra burst of calls; not worth
 // a stateful dependency.
 
-const SOCIAL_RATE_WINDOW_MS = 30 * 1000;
+const SOCIAL_RATE_WINDOW_MS = 10 * 1000;
 const socialRateMap = new Map(); // key: `${ip}:${routeKey}` → lastMs
 
 function rateLimit(req, res, routeKey) {
