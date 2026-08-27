@@ -518,6 +518,10 @@ app.get('/social/youtube/analytics', async (req, res) => {
     const accessToken = await getYouTubeAccessTokenForUser(userId);
 
     const ymd = (d) => d.toISOString().slice(0, 10);
+    // Core metrics available to all channels regardless of monetization status.
+    // Reach metrics (impressions, impressionsClickThroughRate, uniqueViewers) are
+    // fetched separately via /analytics/timeseries. Revenue/card metrics require
+    // YouTube Partner Program and cause 400s on non-monetized channels.
     const metricsList = [
       'views',
       'estimatedMinutesWatched',
@@ -529,20 +533,6 @@ app.get('/social/youtube/analytics', async (req, res) => {
       'dislikes',
       'comments',
       'shares',
-      'cardImpressions',
-      'cardClickRate',
-      'estimatedRevenue',
-      'estimatedAdRevenue',
-      'cpm',
-      'playbackBasedCpm',
-      // Reach-tab additions: the funnel + KPI quad on the YT Studio "Reach"
-      // tab is built from these three. `impressions` is the count of times
-      // a video thumbnail surfaced; `impressionsClickThroughRate` is the
-      // server-side CTR YouTube reports (0–1, not 0–100); `uniqueViewers`
-      // is the de-duplicated viewer count for the window.
-      'impressions',
-      'impressionsClickThroughRate',
-      'uniqueViewers',
     ].join(',');
 
     // Two windows back-to-back so the UI can render the "↑10% vs prior 28d"
@@ -617,13 +607,23 @@ app.get('/social/youtube/analytics', async (req, res) => {
 app.get('/social/youtube/analytics/timeseries', async (req, res) => {
   if (!rateLimit(req, res, 'yt:timeseries')) return;
   try {
-    const report = await runYouTubeAnalyticsReport(req, {
-      metrics: 'impressions,views,estimatedMinutesWatched,impressionsClickThroughRate,uniqueViewers',
-      dimensions: 'day',
-      sort: 'day',
-    });
+    // Try full reach metrics first; fall back to core metrics for non-partner channels.
+    let report;
+    try {
+      report = await runYouTubeAnalyticsReport(req, {
+        metrics: 'impressions,views,estimatedMinutesWatched,impressionsClickThroughRate,uniqueViewers',
+        dimensions: 'day',
+        sort: 'day',
+      });
+    } catch (_) {
+      report = await runYouTubeAnalyticsReport(req, {
+        metrics: 'views,estimatedMinutesWatched',
+        dimensions: 'day',
+        sort: 'day',
+      });
+    }
     const points = report.rows.map(row => {
-      const obj = {};
+      const obj = { impressions: 0, views: 0, estimatedMinutesWatched: 0, impressionsClickThroughRate: 0, uniqueViewers: 0 };
       report.columns.forEach((name, i) => {
         if (name === 'day') obj.date = String(row[i] || '');
         else obj[name] = Number(row[i] || 0);
