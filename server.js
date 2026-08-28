@@ -15,6 +15,8 @@ app.use((req, res, next) => {
   next();
 });
 
+const Anthropic = require('@anthropic-ai/sdk');
+
 const apiKey = process.env.OPENAI_API_KEY;
 if (!apiKey) {
   console.error('OPENAI_API_KEY not set in .env');
@@ -22,6 +24,11 @@ if (!apiKey) {
 }
 
 const openai = new OpenAI({ apiKey });
+
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.warn('ANTHROPIC_API_KEY not set — Stratigize AI routes will fail until added');
+}
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const PORT = process.env.PORT || 3000;
 
@@ -73,7 +80,7 @@ app.post('/analyze', async (req, res) => {
 /**
  * POST /chat
  * Body: { messages: [{ role: string, content: string }], systemPrompt?: string }
- * Used for Stratigize conversation.
+ * Used for Stratigize conversation — powered by Claude.
  */
 app.post('/chat', async (req, res) => {
   try {
@@ -82,24 +89,25 @@ app.post('/chat', async (req, res) => {
       return res.status(400).json({ error: 'messages array is required' });
     }
 
-    const apiMessages = [...messages];
-    if (systemPrompt && typeof systemPrompt === 'string' && systemPrompt.trim()) {
-      apiMessages.unshift({ role: 'system', content: systemPrompt.trim() });
-    }
-
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1-mini',
-      messages: apiMessages,
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 3000,
       temperature: 0.5,
-      max_tokens: 3000
+      ...(systemPrompt?.trim() ? { system: systemPrompt.trim() } : {}),
+      messages: messages.map(m => ({ role: m.role, content: m.content })),
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
     });
 
-    const text = (completion.choices[0]?.message?.content ?? '').trim();
+    const text = response.content
+      .filter(block => block.type === 'text')
+      .map(block => block.text)
+      .join('')
+      .trim();
     res.json({ text });
   } catch (err) {
-    console.error('OpenAI /chat error:', err);
+    console.error('Anthropic /chat error:', err);
     const status = err.status || 500;
-    const message = err.message || 'OpenAI request failed';
+    const message = err.message || 'Anthropic request failed';
     res.status(status).json({ error: message });
   }
 });
@@ -107,7 +115,7 @@ app.post('/chat', async (req, res) => {
 /**
  * POST /chat/stream
  * Body: { messages: [{ role, content }], systemPrompt?: string }
- * Streams SSE tokens from OpenAI so the client can display them in real time.
+ * Streams SSE tokens from Claude so the client can display them in real time.
  */
 app.post('/chat/stream', async (req, res) => {
   try {
@@ -116,34 +124,54 @@ app.post('/chat/stream', async (req, res) => {
       return res.status(400).json({ error: 'messages array is required' });
     }
 
-    const apiMessages = [...messages];
-    if (systemPrompt && typeof systemPrompt === 'string' && systemPrompt.trim()) {
-      apiMessages.unshift({ role: 'system', content: systemPrompt.trim() });
-    }
-
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    const stream = await openai.chat.completions.create({
-      model: 'gpt-4.1-mini',
-      messages: apiMessages,
-      temperature: 0.5,
+    const stream = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
       max_tokens: 3000,
+      temperature: 0.5,
+      ...(systemPrompt?.trim() ? { system: systemPrompt.trim() } : {}),
+      messages: messages.map(m => ({ role: m.role, content: m.content })),
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       stream: true,
     });
 
-    for await (const chunk of stream) {
-      const token = chunk.choices[0]?.delta?.content;
-      if (token) {
-        res.write(`data: ${JSON.stringify({ token })}\n\n`);
+    for await (const event of stream) {
+      // Web search tool call fired → tell client to show "searching" state
+      if (event.type === 'content_block_start' &&
+          event.content_block?.type === 'server_tool_use') {
+        res.write(`data: ${JSON.stringify({ event: 'searching' })}\n\n`);
+      }
+
+      // Web search results arrived → send sources to client
+      if (event.type === 'content_block_start' &&
+          event.content_block?.type === 'web_search_tool_result') {
+        const results = event.content_block.content ?? [];
+        const sources = results
+          .filter(r => r.type === 'web_search_result')
+          .map(r => {
+            let domain = '';
+            try { domain = new URL(r.url ?? '').hostname.replace(/^www\./, ''); } catch {}
+            return { title: r.title ?? '', url: r.url ?? '', domain };
+          });
+        if (sources.length > 0) {
+          res.write(`data: ${JSON.stringify({ event: 'sources', sources })}\n\n`);
+        }
+      }
+
+      // Text tokens
+      if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+        const token = event.delta.text;
+        if (token) res.write(`data: ${JSON.stringify({ token })}\n\n`);
       }
     }
 
     res.write('data: [DONE]\n\n');
     res.end();
   } catch (err) {
-    console.error('OpenAI /chat/stream error:', err);
+    console.error('Anthropic /chat/stream error:', err);
     if (!res.headersSent) {
       res.status(err.status || 500).json({ error: err.message || 'Stream failed' });
     } else {
