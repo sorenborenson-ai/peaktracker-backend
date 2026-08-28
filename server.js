@@ -213,6 +213,10 @@ function rateLimit(req, res, routeKey) {
   return true;
 }
 
+const SHOPIFY_CLIENT_ID     = process.env.SHOPIFY_CLIENT_ID;
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
+const APP_URL               = process.env.APP_URL; // e.g. https://peaktracker-backend-render.onrender.com
+
 const YT_API_KEY             = process.env.YT_API_KEY;
 const YT_OAUTH_CLIENT_ID     = process.env.YT_OAUTH_CLIENT_ID;
 const YT_OAUTH_CLIENT_SECRET = process.env.YT_OAUTH_CLIENT_SECRET;
@@ -810,6 +814,91 @@ app.get('/social/youtube/analytics/geography', async (req, res) => {
   } catch (err) {
     console.error('/social/youtube/analytics/geography error:', err);
     res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Shopify OAuth
+// ---------------------------------------------------------------------------
+//
+// Flow: app hits /social/shopify/oauth/start with shop + Supabase bearer →
+// backend 302s to Shopify → Shopify calls back to /social/shopify/oauth/callback →
+// backend verifies HMAC + state, exchanges code for access token, then redirects
+// to `peaktracker-oauth://shopify/done?status=ok&shop=…&token=…`.
+// The app stores the token in Keychain and uses the existing /social/shopify/stats endpoint.
+
+const shopifyOAuthState = new Map(); // state → { userId, shop, expiresAt }
+
+app.get('/social/shopify/oauth/start', async (req, res) => {
+  try {
+    if (!SHOPIFY_CLIENT_ID || !APP_URL) {
+      return res.status(500).json({ error: 'Shopify OAuth not configured on server. Set SHOPIFY_CLIENT_ID and APP_URL.' });
+    }
+    const userId = await requireSupabaseUserId(req);
+    const shop = (req.query.shop || '').toString().trim()
+      .replace(/^https?:\/\//, '').replace(/\/$/, '').toLowerCase();
+    if (!shop) return res.status(400).json({ error: 'shop is required' });
+
+    const state = require('crypto').randomBytes(16).toString('hex');
+    shopifyOAuthState.set(state, { userId, shop, expiresAt: Date.now() + 10 * 60 * 1000 });
+    for (const [k, v] of shopifyOAuthState) if (v.expiresAt < Date.now()) shopifyOAuthState.delete(k);
+
+    const scopes = 'read_orders,read_products,read_customers,read_inventory,read_reports';
+    const redirectUri = `${APP_URL}/social/shopify/oauth/callback`;
+    const authUrl = `https://${shop}/admin/oauth/authorize?client_id=${SHOPIFY_CLIENT_ID}&scope=${encodeURIComponent(scopes)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
+
+    res.json({ url: authUrl });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+app.get('/social/shopify/oauth/callback', async (req, res) => {
+  const appReturn = (status, extra = {}) => {
+    const q = new URLSearchParams({ status, ...extra });
+    return res.redirect(`peaktracker-oauth://shopify/done?${q.toString()}`);
+  };
+  try {
+    const { code, shop, state, hmac } = req.query;
+    if (!code || !shop || !state) return appReturn('error', { reason: 'missing_params' });
+
+    // Verify Shopify HMAC
+    const message = Object.entries(req.query)
+      .filter(([k]) => k !== 'hmac' && k !== 'signature')
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${k}=${v}`)
+      .join('&');
+    const expectedHmac = require('crypto')
+      .createHmac('sha256', SHOPIFY_CLIENT_SECRET)
+      .update(message)
+      .digest('hex');
+    if (expectedHmac !== String(hmac)) return appReturn('error', { reason: 'hmac_invalid' });
+
+    // Verify state (CSRF)
+    const stateEntry = shopifyOAuthState.get(String(state));
+    if (!stateEntry || stateEntry.expiresAt < Date.now()) return appReturn('error', { reason: 'state_invalid' });
+    shopifyOAuthState.delete(String(state));
+
+    // Exchange code for access token
+    const tokenResp = await fetch(`https://${shop}/admin/oauth/access_token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: SHOPIFY_CLIENT_ID,
+        client_secret: SHOPIFY_CLIENT_SECRET,
+        code: String(code),
+      }),
+    });
+    const tokenJson = await tokenResp.json();
+    if (!tokenResp.ok || !tokenJson.access_token) {
+      console.error('Shopify token exchange failed:', tokenJson);
+      return appReturn('error', { reason: 'token_exchange' });
+    }
+
+    appReturn('ok', { shop: String(shop), token: tokenJson.access_token });
+  } catch (err) {
+    console.error('/social/shopify/oauth/callback error:', err);
+    appReturn('error', { reason: err.message || 'unknown' });
   }
 });
 
