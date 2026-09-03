@@ -224,6 +224,10 @@ const YT_OAUTH_REDIRECT      = process.env.YT_OAUTH_REDIRECT;
 const SUPABASE_URL                = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+const META_APP_ID          = process.env.META_APP_ID;
+const META_APP_SECRET      = process.env.META_APP_SECRET;
+const META_OAUTH_REDIRECT  = process.env.META_OAUTH_REDIRECT_URI;
+
 async function youtubeChannelsList({ id, handle }) {
   if (!YT_API_KEY) throw new Error('YT_API_KEY not set on server');
   const params = new URLSearchParams({
@@ -818,6 +822,164 @@ app.get('/social/youtube/analytics/geography', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Instagram (Meta) OAuth
+// ---------------------------------------------------------------------------
+//
+// Flow: app hits GET /oauth/instagram/start (Bearer Supabase) →
+// backend builds Meta authorize URL → app opens it in ASWebAuthenticationSession →
+// user signs into Facebook, grants scopes →
+// Meta redirects to GET /oauth/instagram/callback?code=…&state=… →
+// backend exchanges code for short-lived token, upgrades to long-lived token,
+// walks /me/accounts to find the linked IG Business account, upserts row in
+// provider_tokens, then redirects to:
+//   peaktracker-oauth://instagram/done?accountId=…&username=…&profilePicture=…
+//   peaktracker-oauth://instagram/done?error=unsupported_account_type
+//   peaktracker-oauth://instagram/done?error=no_facebook_page
+
+const igOAuthState = new Map(); // state → { userId, expiresAt }
+
+function igRememberState(userId) {
+  const state = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  igOAuthState.set(state, { userId, expiresAt: Date.now() + 10 * 60 * 1000 });
+  for (const [k, v] of igOAuthState) if (v.expiresAt < Date.now()) igOAuthState.delete(k);
+  return state;
+}
+function igConsumeState(state) {
+  const entry = igOAuthState.get(state);
+  if (!entry || entry.expiresAt < Date.now()) return null;
+  igOAuthState.delete(state);
+  return entry.userId;
+}
+
+app.get('/oauth/instagram/start', async (req, res) => {
+  try {
+    if (!META_APP_ID || !META_OAUTH_REDIRECT) {
+      return res.status(500).json({ error: 'Instagram OAuth not configured on server.' });
+    }
+    const authHeader = req.headers['authorization'] || '';
+    const supaToken  = authHeader.replace(/^Bearer\s+/i, '');
+    if (!supaToken) return res.status(401).json({ error: 'Not signed in.' });
+
+    // Verify Supabase token and get user id
+    const userResp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      headers: { Authorization: `Bearer ${supaToken}`, apikey: SUPABASE_SERVICE_ROLE_KEY }
+    });
+    if (!userResp.ok) return res.status(401).json({ error: 'Invalid Supabase session.' });
+    const { id: userId } = await userResp.json();
+
+    const state = igRememberState(userId);
+    const scopes = [
+      'instagram_basic',
+      'instagram_manage_insights',
+      'pages_show_list',
+      'pages_read_engagement',
+      'business_management',
+    ].join(',');
+
+    const params = new URLSearchParams({
+      client_id:     META_APP_ID,
+      redirect_uri:  META_OAUTH_REDIRECT,
+      scope:         scopes,
+      response_type: 'code',
+      state,
+    });
+    res.json({ url: `https://www.facebook.com/v19.0/dialog/oauth?${params.toString()}` });
+  } catch (err) {
+    console.error('/oauth/instagram/start error:', err);
+    res.status(500).json({ error: 'Internal error.' });
+  }
+});
+
+app.get('/oauth/instagram/callback', async (req, res) => {
+  const redirect = (params) =>
+    res.redirect(`peaktracker-oauth://instagram/done?${new URLSearchParams(params).toString()}`);
+
+  try {
+    const { code, state, error: metaError } = req.query;
+    if (metaError) return redirect({ error: metaError });
+    if (!code || !state) return redirect({ error: 'missing_params' });
+
+    const userId = igConsumeState(String(state));
+    if (!userId) return redirect({ error: 'state_invalid' });
+
+    // 1. Exchange code for short-lived user token
+    const tokenResp = await fetch('https://graph.facebook.com/v19.0/oauth/access_token?' + new URLSearchParams({
+      client_id:     META_APP_ID,
+      client_secret: META_APP_SECRET,
+      redirect_uri:  META_OAUTH_REDIRECT,
+      code,
+    }));
+    const tokenData = await tokenResp.json();
+    if (!tokenData.access_token) {
+      console.error('Meta token exchange failed:', tokenData);
+      return redirect({ error: 'token_exchange_failed', error_description: tokenData.error?.message });
+    }
+    const shortToken = tokenData.access_token;
+
+    // 2. Upgrade to long-lived token (valid ~60 days)
+    const longResp = await fetch('https://graph.facebook.com/v19.0/oauth/access_token?' + new URLSearchParams({
+      grant_type:        'fb_exchange_token',
+      client_id:         META_APP_ID,
+      client_secret:     META_APP_SECRET,
+      fb_exchange_token: shortToken,
+    }));
+    const longData = await longResp.json();
+    const longToken = longData.access_token || shortToken;
+
+    // 3. Walk /me/accounts to find Facebook Pages + linked IG business accounts
+    const accountsResp = await fetch(
+      `https://graph.facebook.com/v19.0/me/accounts?fields=id,name,instagram_business_account&access_token=${longToken}`
+    );
+    const accountsData = await accountsResp.json();
+    const pages = accountsData.data || [];
+
+    // Find the first page that has a linked IG business account
+    const page = pages.find(p => p.instagram_business_account?.id);
+    if (!page) {
+      // Check if user has a personal IG (not business) — give specific error
+      const meResp = await fetch(`https://graph.facebook.com/v19.0/me?fields=id,name&access_token=${longToken}`);
+      const meData = await meResp.json();
+      if (pages.length === 0) return redirect({ error: 'no_facebook_page' });
+      return redirect({ error: 'unsupported_account_type' });
+    }
+
+    const igAccountId = page.instagram_business_account.id;
+
+    // 4. Fetch IG account details
+    const igResp = await fetch(
+      `https://graph.facebook.com/v19.0/${igAccountId}?fields=id,username,profile_picture_url,followers_count&access_token=${longToken}`
+    );
+    const igData = await igResp.json();
+    const username       = igData.username || '';
+    const profilePicture = igData.profile_picture_url || '';
+
+    // 5. Persist token in Supabase provider_tokens (upsert by user_id + platform)
+    await fetch(`${SUPABASE_URL}/rest/v1/provider_tokens?on_conflict=user_id,platform`, {
+      method: 'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'apikey':        SUPABASE_SERVICE_ROLE_KEY,
+        'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        'Prefer':        'resolution=merge-duplicates',
+      },
+      body: JSON.stringify({
+        user_id:    userId,
+        platform:   'instagram',
+        account_id: igAccountId,
+        token:      longToken,
+        username,
+        updated_at: new Date().toISOString(),
+      }),
+    });
+
+    redirect({ accountId: igAccountId, username, profilePicture });
+  } catch (err) {
+    console.error('/oauth/instagram/callback error:', err);
+    redirect({ error: 'internal_error', error_description: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Shopify OAuth
 // ---------------------------------------------------------------------------
 //
@@ -843,7 +1005,7 @@ app.get('/social/shopify/oauth/start', async (req, res) => {
     shopifyOAuthState.set(state, { userId, shop, expiresAt: Date.now() + 10 * 60 * 1000 });
     for (const [k, v] of shopifyOAuthState) if (v.expiresAt < Date.now()) shopifyOAuthState.delete(k);
 
-    const scopes = 'read_orders,read_products,read_customers,read_inventory,read_reports';
+    const scopes = 'read_orders,read_products,read_customers,read_inventory,read_reports,read_analytics';
     const redirectUri = `${APP_URL}/social/shopify/oauth/callback`;
     const authUrl = `https://${shop}/admin/oauth/authorize?client_id=${SHOPIFY_CLIENT_ID}&scope=${encodeURIComponent(scopes)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
 
@@ -902,12 +1064,33 @@ app.get('/social/shopify/oauth/callback', async (req, res) => {
   }
 });
 
+/// Runs a ShopifyQL query via the GraphQL Admin API. Returns the parsed JSON.
+/// Analytics data is optional — callers should catch and treat errors as empty.
+async function shopifyGraphQL({ shop, token, query }) {
+  const resp = await fetch(`https://${shop}/admin/api/2024-10/graphql.json`, {
+    method: 'POST',
+    headers: {
+      'X-Shopify-Access-Token': token,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify({ query })
+  });
+  if (!resp.ok) {
+    const e = new Error(`Shopify GraphQL ${resp.status}`);
+    e.status = resp.status;
+    throw e;
+  }
+  return resp.json();
+}
+
 /// Walks Shopify Admin REST cursor pagination, capped at maxPages so a
 /// pathological 50k-order store can't tie up this Render instance for
 /// minutes. The cap is generous (5 × 250 = 1250 orders) and almost always
 /// enough for a 30-day window.
-async function shopifyAllOrders({ shop, token, sinceISO, maxPages = 5 }) {
+async function shopifyAllOrders({ shop, token, sinceISO, untilISO, maxPages = 5 }) {
   let url = `https://${shop}/admin/api/2024-10/orders.json?status=any&limit=250&created_at_min=${encodeURIComponent(sinceISO)}`;
+  if (untilISO) url += `&created_at_max=${encodeURIComponent(untilISO)}`;
   const orders = [];
   for (let i = 0; i < maxPages && url; i++) {
     const resp = await fetch(url, {
@@ -952,16 +1135,34 @@ app.post('/social/shopify/stats', async (req, res) => {
     // Strip protocol/path if user pasted a full URL.
     shop = shop.replace(/^https?:\/\//, '').replace(/\/+$/, '').trim();
 
-    const sinceISO = new Date(Date.now() - sinceDays * 86400 * 1000).toISOString();
-    const orders = await shopifyAllOrders({ shop, token, sinceISO });
+    // Accept explicit ISO date range if provided; fall back to sinceDays window.
+    const { sinceISO: explicitSince, untilISO: explicitUntil } = req.body || {};
+    const sinceISO = (explicitSince && typeof explicitSince === 'string') ? explicitSince
+      : new Date(Date.now() - sinceDays * 86400 * 1000).toISOString();
+    const untilISO = (explicitUntil && typeof explicitUntil === 'string') ? explicitUntil : null;
+    const orders = await shopifyAllOrders({ shop, token, sinceISO, untilISO });
 
     let revenue = 0;
     let refunds = 0;
+    let discounts = 0;
+    let tax = 0;
+    let shipping = 0;
+    let fulfilled = 0;
     const customerOrderCounts = new Map(); // customer.id → count of orders in window
+    const dailyMap = new Map();            // 'YYYY-MM-DD' → { revenue, orders }
+    const channelMap = new Map();          // source_name  → { revenue, orders }
+    const productMap = new Map();          // product title → { revenue, orders, quantity }
+    const referrerMap = new Map();         // referring domain → { revenue, orders }
 
     for (const o of orders) {
       const total = Number(o.total_price || 0);
       revenue += total;
+      discounts += Number(o.total_discounts || 0);
+      tax += Number(o.total_tax || 0);
+      if (Array.isArray(o.shipping_lines)) {
+        for (const sl of o.shipping_lines) shipping += Number(sl.price || 0);
+      }
+      if (o.fulfillment_status === 'fulfilled') fulfilled++;
       if (Array.isArray(o.refunds)) {
         for (const r of o.refunds) {
           if (Array.isArray(r.transactions)) {
@@ -975,6 +1176,40 @@ app.post('/social/shopify/stats', async (req, res) => {
       }
       const cid = o.customer?.id;
       if (cid != null) customerOrderCounts.set(cid, (customerOrderCounts.get(cid) || 0) + 1);
+      const day = o.created_at ? o.created_at.slice(0, 10) : null;
+      if (day) {
+        const d = dailyMap.get(day) || { revenue: 0, orders: 0 };
+        d.revenue += total;
+        d.orders += 1;
+        dailyMap.set(day, d);
+      }
+      const ch = o.source_name || 'unknown';
+      const cv = channelMap.get(ch) || { revenue: 0, orders: 0 };
+      cv.revenue += total;
+      cv.orders += 1;
+      channelMap.set(ch, cv);
+      if (Array.isArray(o.line_items)) {
+        for (const item of o.line_items) {
+          const title = item.title || 'Unknown';
+          const qty = Number(item.quantity || 1);
+          const itemRev = Number(item.price || 0) * qty;
+          const pv = productMap.get(title) || { revenue: 0, orders: 0, quantity: 0 };
+          pv.revenue += itemRev;
+          pv.orders += 1;
+          pv.quantity += qty;
+          productMap.set(title, pv);
+        }
+      }
+      // Referrer from order
+      const refSite = o.referring_site || '';
+      if (refSite) {
+        let refDomain = 'unknown';
+        try { refDomain = new URL(refSite).hostname.replace(/^www\./, ''); } catch {}
+        const rv = referrerMap.get(refDomain) || { revenue: 0, orders: 0 };
+        rv.revenue += total;
+        rv.orders += 1;
+        referrerMap.set(refDomain, rv);
+      }
     }
 
     const orderCount = orders.length;
@@ -982,17 +1217,236 @@ app.post('/social/shopify/stats', async (req, res) => {
     const totalCustomers = customerOrderCounts.size;
     const repeatCustomers = [...customerOrderCounts.values()].filter(n => n > 1).length;
     const repeatRate = totalCustomers > 0 ? (repeatCustomers / totalCustomers) * 100 : 0;
+    const netSales = revenue - discounts - refunds;
+    const timeseries = [...dailyMap.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, v]) => ({
+        date,
+        revenue: Number(v.revenue.toFixed(2)),
+        orders: v.orders,
+        aov: v.orders > 0 ? Number((v.revenue / v.orders).toFixed(2)) : 0
+      }));
+    const channels = [...channelMap.entries()]
+      .map(([channel, v]) => ({ channel, revenue: Number(v.revenue.toFixed(2)), orders: v.orders }))
+      .sort((a, b) => b.revenue - a.revenue);
+    const topProducts = [...productMap.entries()]
+      .map(([title, v]) => ({ title, revenue: Number(v.revenue.toFixed(2)), orders: v.orders, quantity: v.quantity }))
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 10);
+
+    // Sell-through rate: fetch current inventory per product and compare to units sold.
+    let sellThrough = [];
+    try {
+      let allProducts = [];
+      let nextUrl = `https://${shop}/admin/api/2024-01/products.json?limit=250&fields=id,title,variants`;
+      while (nextUrl) {
+        const pr = await fetch(nextUrl, { headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' } });
+        if (!pr.ok) break;
+        const pd = await pr.json();
+        allProducts = allProducts.concat(pd.products || []);
+        const link = pr.headers.get('link') || '';
+        const m = link.match(/<([^>]+)>;\s*rel="next"/);
+        nextUrl = m ? m[1] : null;
+      }
+      sellThrough = allProducts.map(p => {
+        const inventoryQty = (p.variants || []).reduce((s, v) => s + Math.max(0, Number(v.inventory_quantity) || 0), 0);
+        const sold = productMap.get(p.title)?.quantity || 0;
+        const rate = (sold + inventoryQty) > 0 ? (sold / (sold + inventoryQty)) * 100 : 0;
+        return { title: p.title, sold, inventoryQty, rate: Number(rate.toFixed(1)) };
+      })
+      .filter(p => p.sold > 0 || p.inventoryQty > 0)
+      .sort((a, b) => b.sold - a.sold)
+      .slice(0, 20);
+    } catch (stErr) {
+      console.warn('/social/shopify/stats sell-through (non-fatal):', stErr.message);
+    }
+
+    // POS location breakdown: group orders by location_id using the locations endpoint.
+    let posByLocation = [];
+    try {
+      const locResp = await fetch(`https://${shop}/admin/api/2024-01/locations.json`, {
+        headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' }
+      });
+      if (locResp.ok) {
+        const locData = await locResp.json();
+        const locationNames = new Map((locData.locations || []).map(l => [String(l.id), l.name]));
+        const locationMap = new Map();
+        for (const o of orders) {
+          if (!o.location_id) continue;
+          const name = locationNames.get(String(o.location_id)) || `Location ${o.location_id}`;
+          const total = Number(o.total_price || 0);
+          const lv = locationMap.get(name) || { revenue: 0, orders: 0 };
+          lv.revenue += total;
+          lv.orders += 1;
+          locationMap.set(name, lv);
+        }
+        posByLocation = [...locationMap.entries()]
+          .map(([name, v]) => ({ name, revenue: Number(v.revenue.toFixed(2)), orders: v.orders }))
+          .sort((a, b) => b.revenue - a.revenue);
+      }
+    } catch (posErr) {
+      console.warn('/social/shopify/stats POS locations (non-fatal):', posErr.message);
+    }
+
+    const SOCIAL_DOMAINS = new Set(['instagram.com','facebook.com','twitter.com','x.com','tiktok.com','pinterest.com','youtube.com','linkedin.com','snapchat.com','reddit.com']);
+    const SEARCH_DOMAINS = new Set(['google.com','bing.com','yahoo.com','duckduckgo.com','baidu.com','yandex.com']);
+    const referrers = [...referrerMap.entries()]
+      .map(([source, v]) => ({
+        source,
+        revenue: Number(v.revenue.toFixed(2)),
+        orders: v.orders,
+        channel: SOCIAL_DOMAINS.has(source) ? 'Social' : SEARCH_DOMAINS.has(source) ? 'Search' : source === 'unknown' ? 'Direct' : 'Other'
+      }))
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 10);
+
+    // Store brand logo — optional, silently omitted if the store hasn't set one.
+    let logoURL = null;
+    try {
+      const brandResult = await shopifyGraphQL({ shop, token, query: `{
+        shop { brand { logo { image { url } } } }
+      }` });
+      logoURL = brandResult?.data?.shop?.brand?.logo?.image?.url ?? null;
+    } catch (_) { /* non-fatal */ }
+
+    // ShopifyQL — sessions + conversion + device/location/landing/referrer data.
+    // Optional: silently omitted if the store is on a plan that doesn't support read_analytics.
+    let sessionTimeseries = [];
+    let conversionFunnel  = null;
+    let deviceTypes       = [];
+    let locations         = [];
+    let landingPages      = [];
+    let sessionReferrers  = [];
+    try {
+      const since = explicitSince ? sinceISO.slice(0, 10) : `-${sinceDays}d`;
+      const until = untilISO ? untilISO.slice(0, 10) : 'today';
+      const [sessResult, funnelResult, deviceResult, locationResult, landingResult, sessRefResult] = await Promise.all([
+        shopifyGraphQL({ shop, token, query: `{
+          shopifyqlQuery(query: "FROM sessions SHOW day, sessions, conversion_rate SINCE ${since} UNTIL ${until} ORDER BY day ASC") {
+            ... on TableResponse { tableData { headers { name } rowData } }
+            ... on ParseErrorResponse { parseErrors { code message } }
+          }
+        }` }),
+        shopifyGraphQL({ shop, token, query: `{
+          shopifyqlQuery(query: "FROM sessions SHOW sessions, added_to_cart_sessions, reached_checkout_sessions, orders_placed_sessions SINCE ${since} UNTIL ${until}") {
+            ... on TableResponse { tableData { headers { name } rowData } }
+          }
+        }` }),
+        shopifyGraphQL({ shop, token, query: `{
+          shopifyqlQuery(query: "FROM sessions SHOW device_type, sessions SINCE ${since} UNTIL ${until} ORDER BY sessions DESC") {
+            ... on TableResponse { tableData { headers { name } rowData } }
+          }
+        }` }),
+        shopifyGraphQL({ shop, token, query: `{
+          shopifyqlQuery(query: "FROM sessions SHOW country, region, city, sessions SINCE ${since} UNTIL ${until} ORDER BY sessions DESC") {
+            ... on TableResponse { tableData { headers { name } rowData } }
+          }
+        }` }),
+        shopifyGraphQL({ shop, token, query: `{
+          shopifyqlQuery(query: "FROM sessions SHOW landing_page_url, sessions SINCE ${since} UNTIL ${until} ORDER BY sessions DESC") {
+            ... on TableResponse { tableData { headers { name } rowData } }
+          }
+        }` }),
+        shopifyGraphQL({ shop, token, query: `{
+          shopifyqlQuery(query: "FROM sessions SHOW referrer_source, sessions SINCE ${since} UNTIL ${until} ORDER BY sessions DESC") {
+            ... on TableResponse { tableData { headers { name } rowData } }
+          }
+        }` })
+      ]);
+
+      const sessTable = sessResult?.data?.shopifyqlQuery?.tableData;
+      if (sessTable) {
+        const hdr = sessTable.headers.map(h => h.name);
+        const di  = hdr.indexOf('day');
+        const si  = hdr.indexOf('sessions');
+        const cri = hdr.indexOf('conversion_rate');
+        sessionTimeseries = sessTable.rowData.map(row => ({
+          date:           row[di],
+          sessions:       Number(row[si]  || 0),
+          conversionRate: Number(row[cri] || 0)
+        }));
+      }
+
+      const funTable = funnelResult?.data?.shopifyqlQuery?.tableData;
+      if (funTable && funTable.rowData.length > 0) {
+        const fh  = funTable.headers.map(h => h.name);
+        const row = funTable.rowData[0];
+        conversionFunnel = {
+          sessions:         Number(row[fh.indexOf('sessions')]                  || 0),
+          addedToCart:      Number(row[fh.indexOf('added_to_cart_sessions')]    || 0),
+          reachedCheckout:  Number(row[fh.indexOf('reached_checkout_sessions')] || 0),
+          completed:        Number(row[fh.indexOf('orders_placed_sessions')]    || 0)
+        };
+      }
+
+      const devTable = deviceResult?.data?.shopifyqlQuery?.tableData;
+      if (devTable) {
+        const h = devTable.headers.map(h => h.name);
+        deviceTypes = devTable.rowData.map(row => ({
+          device: row[h.indexOf('device_type')] || 'Unknown',
+          sessions: Number(row[h.indexOf('sessions')] || 0)
+        })).filter(d => d.sessions > 0);
+      }
+
+      const locTable = locationResult?.data?.shopifyqlQuery?.tableData;
+      if (locTable) {
+        const h = locTable.headers.map(h => h.name);
+        const ci = h.indexOf('country'), ri = h.indexOf('region'), ci2 = h.indexOf('city'), si2 = h.indexOf('sessions');
+        locations = locTable.rowData.map(row => ({
+          location: [row[ci], row[ri], row[ci2]].filter(Boolean).join(' · '),
+          sessions: Number(row[si2] || 0)
+        })).filter(d => d.sessions > 0).slice(0, 10);
+      }
+
+      const landTable = landingResult?.data?.shopifyqlQuery?.tableData;
+      if (landTable) {
+        const h = landTable.headers.map(h => h.name);
+        landingPages = landTable.rowData.map(row => ({
+          url: row[h.indexOf('landing_page_url')] || '/',
+          sessions: Number(row[h.indexOf('sessions')] || 0)
+        })).filter(d => d.sessions > 0).slice(0, 10);
+      }
+
+      const sessRefTable = sessRefResult?.data?.shopifyqlQuery?.tableData;
+      if (sessRefTable) {
+        const h = sessRefTable.headers.map(h => h.name);
+        sessionReferrers = sessRefTable.rowData.map(row => ({
+          source: row[h.indexOf('referrer_source')] || 'Direct',
+          sessions: Number(row[h.indexOf('sessions')] || 0)
+        })).filter(d => d.sessions > 0).slice(0, 10);
+      }
+    } catch (analyticsErr) {
+      console.warn('/social/shopify/stats analytics (non-fatal):', analyticsErr.message);
+    }
 
     res.json({
       shop,
       windowDays: sinceDays,
+      logoURL,
       stats: [
         { key: 'shOrders',     value: orderCount },
         { key: 'shRevenue',    value: Number(revenue.toFixed(2)) },
         { key: 'shAOV',        value: Number(aov.toFixed(2)) },
         { key: 'shRefunds',    value: Number(refunds.toFixed(2)) },
-        { key: 'shRepeatRate', value: Number(repeatRate.toFixed(1)) }
-      ]
+        { key: 'shRepeatRate', value: Number(repeatRate.toFixed(1)) },
+        { key: 'shDiscounts',  value: Number(discounts.toFixed(2)) },
+        { key: 'shTax',        value: Number(tax.toFixed(2)) },
+        { key: 'shShipping',   value: Number(shipping.toFixed(2)) },
+        { key: 'shNetSales',   value: Number(netSales.toFixed(2)) },
+        { key: 'shFulfilled',  value: fulfilled }
+      ],
+      timeseries,
+      channels,
+      topProducts,
+      sessionTimeseries,
+      conversionFunnel,
+      referrers,
+      deviceTypes,
+      locations,
+      landingPages,
+      sessionReferrers,
+      sellThrough,
+      posByLocation
     });
   } catch (err) {
     console.error('/social/shopify/stats error:', err);
