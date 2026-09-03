@@ -852,6 +852,11 @@ function igConsumeState(state) {
   return entry.userId;
 }
 
+// Temporary debug — shows exactly what redirect_uri and app_id the backend uses
+app.get('/debug/instagram', (req, res) => {
+  res.json({ META_APP_ID, META_OAUTH_REDIRECT });
+});
+
 app.get('/oauth/instagram/start', async (req, res) => {
   try {
     if (!META_APP_ID) return res.status(500).json({ error: 'META_APP_ID missing on server.' });
