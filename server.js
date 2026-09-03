@@ -226,7 +226,8 @@ const SUPABASE_SERVICE_ROLE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const META_APP_ID          = process.env.META_APP_ID;
 const META_APP_SECRET      = process.env.META_APP_SECRET;
-const META_OAUTH_REDIRECT  = process.env.META_OAUTH_REDIRECT_URI;
+const META_OAUTH_REDIRECT  = process.env.META_OAUTH_REDIRECT_URI
+  || 'https://peaktracker-backend-render.onrender.com/oauth/instagram/callback';
 
 async function youtubeChannelsList({ id, handle }) {
   if (!YT_API_KEY) throw new Error('YT_API_KEY not set on server');
