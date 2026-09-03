@@ -853,9 +853,8 @@ function igConsumeState(state) {
 
 app.get('/oauth/instagram/start', async (req, res) => {
   try {
-    if (!META_APP_ID || !META_OAUTH_REDIRECT) {
-      return res.status(500).json({ error: 'Instagram OAuth not configured on server.' });
-    }
+    if (!META_APP_ID) return res.status(500).json({ error: 'META_APP_ID missing on server.' });
+    if (!META_OAUTH_REDIRECT) return res.status(500).json({ error: 'META_OAUTH_REDIRECT_URI missing on server.' });
     const authHeader = req.headers['authorization'] || '';
     const supaToken  = authHeader.replace(/^Bearer\s+/i, '');
     if (!supaToken) return res.status(401).json({ error: 'Not signed in.' });
