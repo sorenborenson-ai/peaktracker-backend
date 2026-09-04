@@ -879,7 +879,7 @@ app.get('/oauth/instagram/start', async (req, res) => {
       'pages_show_list',
       'pages_read_engagement',
       'business_management',
-    ].join(',');
+    ].join(' ');
 
     const params = new URLSearchParams({
       client_id:     META_APP_ID,
